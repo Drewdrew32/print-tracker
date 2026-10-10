@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Print Tracker</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧊</text></svg>">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/orders">Print Tracker</a>
+    <nav id="nav" hidden>
+      <a href="#/orders" data-tab="orders">Orders</a>
+      <a href="#/shipments" data-tab="shipments">Shipments</a>
+      <a href="#/payments" data-tab="payments">Payments</a>
+      <a href="#/statement" data-tab="statement">Statement</a>
+      <a href="#/customers" data-tab="customers">Customers</a>
+      <a href="#/filaments" data-tab="filaments">Filaments</a>
+      <a href="#/settings" data-tab="settings">Settings</a>
+    </nav>
+    <span id="sync" class="sync"></span>
+  </header>
+  <main id="app"><p class="muted">Loading…</p></main>
+  <div id="toast" class="toast" hidden></div>
+  <script src="app.js"></script>
+</body>
+</html>
