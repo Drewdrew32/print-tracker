@@ -1,6 +1,6 @@
 # Print Tracker
 
-A small web app for tracking 3D printing orders: order entry, labour and filament cost calculation, shared shipping, payments with overage, status tracking, and printable customer statements.
+A small web app for tracking 3D printing orders: order entry (with measurements, optional due dates and links), labour, filament and machine cost calculation, shared shipping, payments with overage, status tracking, filament stock, a yearly summary, and printable customer statements.
 
 The app is a static page (plain HTML, CSS and JavaScript, no build step) hosted on GitHub Pages. It holds no data itself. Orders are stored as `data.json` in a separate **private** repository and read and written through the GitHub API with a personal access token that stays in your browser. Every save is a commit, so the data repo keeps the full history.
 
@@ -16,10 +16,15 @@ The token is saved in that browser's local storage. Use **Settings → Sign out 
 ## How costs are calculated
 
 - **Labour** = hours × the labour rate in effect on the order's received date (Settings).
-- **Materials** = for each filament line, grams × quantity × (spool price ÷ spool weight).
+- **Materials** = for each filament line, grams × quantity × (spool price ÷ spool weight), plus the order's failed print allowance (%).
+- **Machine** = print hours × the order's machine rate. New orders take the allowance and machine rate from Settings.
 - **Shipping** = the shipment's cost split evenly across the orders in it, to the cent.
 - **Payments** cover what the ticked orders still owe; anything over is recorded as overage and split evenly across those orders. A short payment is shared in proportion to what each order owes.
 - Orders imported from the original spreadsheet keep the amounts that were billed at the time. Each one can be switched back to calculated amounts on its order page.
+
+## Filament stock
+
+Count what's on hand for a filament on the Filaments page, then log spools as you buy them. Orders created after the count use up their grams (including the failed print allowance). A warning shows on the Orders page when a filament drops below its "warn below" level.
 
 ## Files
 

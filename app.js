@@ -123,6 +123,8 @@ function emptyData() {
       defaultCustomerId: 'c-dbc',
       labourRates: [{ from: '2000-01-01', rate: 30 }],
       currency: 'CAD',
+      machineRate: 0,
+      wastePct: 0,
     },
     customers: [{ id: 'c-dbc', name: 'Dutch Boys Chocolate', contact: '', email: '', notes: '' }],
     filaments: [],
@@ -144,10 +146,35 @@ function rateOn(data, date) {
 
 const perGram = (f) => (f && Number(f.spoolGrams) ? Number(f.spoolCost) / Number(f.spoolGrams) : 0);
 
+const lineGrams = (line) => num(line.grams) * (num(line.qty) || 1);
+const wasteFactor = (o) => 1 + num(o.wastePct) / 100;
+
 function lineCost(data, line) {
   const f = data.filaments.find((x) => x.id === line.filamentId);
-  return num(line.grams) * (num(line.qty) || 1) * perGram(f);
+  return lineGrams(line) * perGram(f);
 }
+
+/* Grams of each filament an order uses, including its failed-print allowance. */
+function orderGrams(o) {
+  const out = new Map();
+  for (const l of o.filaments || []) {
+    if (l.filamentId) out.set(l.filamentId, (out.get(l.filamentId) || 0) + lineGrams(l) * wasteFactor(o));
+  }
+  return out;
+}
+
+/* Stock on hand: the latest count, plus spools added since, minus what orders
+   created after that count used. Returns null when stock isn't tracked. */
+function filamentStock(data, f) {
+  const log = [...(f.stockLog || [])].sort((a, b) => a.at.localeCompare(b.at));
+  const lastCount = [...log].reverse().find((e) => e.type === 'count');
+  if (!lastCount) return null;
+  const added = sum(log.filter((e) => e.type === 'add' && e.at >= lastCount.at).map((e) => e.grams));
+  const used = sum(data.orders.filter((o) => o.createdAt && o.createdAt > lastCount.at).map((o) => orderGrams(o).get(f.id) || 0));
+  return r2(num(lastCount.grams) + added - used);
+}
+
+const isLow = (f, stock) => stock != null && stock <= num(f.lowGrams ?? 200);
 
 /* Builds every derived number the screens need in one pass. */
 function ledger(data) {
@@ -163,15 +190,17 @@ function ledger(data) {
   for (const o of data.orders) {
     const computed = {
       labour: r2(num(o.hours) * rateOn(data, o.received)),
-      materials: r2(sum((o.filaments || []).map((l) => lineCost(data, l)))),
+      materials: r2(sum((o.filaments || []).map((l) => lineCost(data, l))) * wasteFactor(o)),
+      machine: r2(num(o.printHours) * num(o.machineRate)),
       shipping: shipShare.get(o.id) || 0,
     };
     const labour = o.labourOverride ?? computed.labour;
     const materials = o.materialsOverride ?? computed.materials;
+    const machine = computed.machine;
     const shipping = o.shippingOverride ?? computed.shipping;
     orders.set(o.id, {
-      computed, labour, materials, shipping,
-      total: r2(labour + materials + shipping),
+      computed, labour, materials, machine, shipping,
+      total: r2(labour + materials + machine + shipping),
       shipment: shipOf.get(o.id) || null,
       paid: 0, overage: 0, payments: [],
     });
@@ -292,6 +321,7 @@ function route() {
     payments: () => renderPayments(app),
     payment: () => renderPaymentForm(app, id),
     statement: () => renderStatement(app, params),
+    summary: () => renderSummary(app, params),
     customers: () => renderCustomers(app),
     filaments: () => renderFilaments(app),
     settings: () => renderSettings(app),
@@ -350,13 +380,15 @@ function renderOrders(app, params) {
   const q = (params.get('q') || '').toLowerCase();
   const year = new Date().getFullYear().toString();
   const multiCustomer = new Set(db.orders.map((o) => o.customerId)).size > 1;
+  const isOverdue = (o) => o.dueDate && o.dueDate < today() && (o.status === 'Not started' || o.status === 'In Progress');
 
   const matches = (o) => {
     const c = L.orders.get(o.id);
     if (filter === 'Open' && o.status === 'Complete') return false;
     if (filter === 'Unpaid' && !(c.balance > 0.004)) return false;
+    if (filter === 'Overdue' && !isOverdue(o)) return false;
     if (STATUSES.includes(filter) && o.status !== filter) return false;
-    if (q && !`${o.number} ${o.description} ${o.comments} ${customerName(o.customerId)}`.toLowerCase().includes(q)) return false;
+    if (q && !`${o.number} ${o.description} ${o.measurements || ''} ${o.comments} ${customerName(o.customerId)}`.toLowerCase().includes(q)) return false;
     return true;
   };
   const list = sortOrders(db.orders.filter(matches));
@@ -366,6 +398,8 @@ function renderOrders(app, params) {
   const openCount = db.orders.filter((o) => o.status !== 'Complete').length;
   const overage = sum(all.map((c) => c.overage));
 
+  const overdueCount = db.orders.filter(isOverdue).length;
+  const lowStock = db.filaments.map((f) => ({ f, left: filamentStock(db, f) })).filter(({ f, left }) => isLow(f, left));
   const counts = Object.fromEntries(STATUSES.map((s) => [s, db.orders.filter((o) => o.status === s).length]));
   const chip = (key, text) => `<button class="chip ${filter === key ? 'on' : ''}" data-filter="${esc(key)}">${esc(text)}</button>`;
 
@@ -375,6 +409,7 @@ function renderOrders(app, params) {
     return `<tr class="click" data-id="${esc(o.id)}">
       <td>${esc(o.number)}</td>
       <td class="hide-sm">${esc(o.received || '')}</td>
+      <td class="hide-sm ${isOverdue(o) ? 'neg' : ''}">${esc(o.dueDate || '')}${isOverdue(o) ? ' <b>overdue</b>' : ''}</td>
       ${multiCustomer ? `<td>${esc(customerName(o.customerId))}</td>` : ''}
       <td>${esc(o.description)}</td>
       <td class="hide-sm">${esc(fil)}</td>
@@ -392,6 +427,8 @@ function renderOrders(app, params) {
       <div class="card"><div class="label">Received in ${year}</div><div class="value">${money(receivedThisYear)}</div></div>
       <div class="card"><div class="label">Overage received (all time)</div><div class="value">${money(overage)}</div></div>
     </div>
+    ${overdueCount ? `<div class="note">${overdueCount} order${overdueCount > 1 ? 's are' : ' is'} past the due date. <a href="#/orders?status=Overdue">Show overdue</a></div>` : ''}
+    ${lowStock.length ? `<div class="note">Running low: ${lowStock.map(({ f, left }) => `${esc(f.name)} (${Math.max(0, Math.round(left))} g)`).join(', ')}. <a href="#/filaments">Filament stock</a></div>` : ''}
     <div class="toolbar">
       <h1 style="margin:0">Orders</h1><span class="spacer"></span>
       <a class="btn primary" href="#/order/new">New order</a>
@@ -401,14 +438,15 @@ function renderOrders(app, params) {
         ${chip('Open', 'Open')}
         ${STATUSES.map((s) => chip(s, `${s} (${counts[s]})`)).join('')}
         ${chip('Unpaid', 'Unpaid')}
+        ${overdueCount || filter === 'Overdue' ? chip('Overdue', `Overdue (${overdueCount})`) : ''}
         ${chip('All', 'All')}
       </div>
       <span class="spacer"></span>
       <input id="search" type="search" placeholder="Search orders" value="${esc(q)}" style="max-width:240px">
     </div>
     <div class="table-wrap"><table>
-      <thead><tr><th>#</th><th class="hide-sm">Received</th>${multiCustomer ? '<th>Customer</th>' : ''}<th>Description</th><th class="hide-sm">Filament</th><th class="num hide-sm">Hrs</th><th class="num">Total</th><th class="num">Owing</th><th>Status</th></tr></thead>
-      <tbody>${rows || `<tr><td colspan="9" class="muted">No orders match.</td></tr>`}</tbody>
+      <thead><tr><th>#</th><th class="hide-sm">Received</th><th class="hide-sm">Due</th>${multiCustomer ? '<th>Customer</th>' : ''}<th>Description</th><th class="hide-sm">Filament</th><th class="num hide-sm">Hrs</th><th class="num">Total</th><th class="num">Owing</th><th>Status</th></tr></thead>
+      <tbody>${rows || `<tr><td colspan="10" class="muted">No orders match.</td></tr>`}</tbody>
     </table></div>`;
 
   const go = (status, query) => {
@@ -453,10 +491,19 @@ function lineHtml(line = {}) {
   </div>`;
 }
 
+function linkList(text) {
+  const urls = String(text || '').split(/\s+/).filter((u) => /^https?:\/\//i.test(u));
+  return urls.map((u) => `<div><a href="${esc(u)}" target="_blank" rel="noopener noreferrer">${esc(u)}</a></div>`).join('');
+}
+
 function renderOrderForm(app, id) {
   const isNew = !id || id === 'new';
   const o = isNew
-    ? { id: uid('o'), number: nextOrderNumber(), customerId: db.settings.defaultCustomerId, received: today(), description: '', hours: '', filaments: [{ qty: 1 }], status: 'Not started', comments: '' }
+    ? {
+      id: uid('o'), number: nextOrderNumber(), customerId: db.settings.defaultCustomerId, received: today(), dueDate: '',
+      description: '', measurements: '', hours: '', printHours: '', filaments: [{ qty: 1 }], status: 'Not started', comments: '', links: '',
+      machineRate: num(db.settings.machineRate), wastePct: num(db.settings.wastePct), createdAt: new Date().toISOString(),
+    }
     : orderById(id);
   if (!o) { app.innerHTML = '<p>Order not found. <a href="#/orders">Back to orders</a></p>'; return; }
   const L = ledger(db);
@@ -471,6 +518,7 @@ function renderOrderForm(app, id) {
         <label class="narrow">Order #<input name="number" required value="${esc(o.number)}"></label>
         <label>Customer<select name="customerId">${customerOptions(o.customerId)}</select></label>
         <label class="narrow" style="flex-basis:150px">Received<input name="received" type="date" value="${esc(o.received || '')}"></label>
+        <label class="narrow" style="flex-basis:150px">Due (optional)<input name="dueDate" type="date" value="${esc(o.dueDate || '')}"></label>
         <label class="narrow" style="flex-basis:150px">Status<select name="status">${STATUSES.map((s) => `<option ${s === o.status ? 'selected' : ''}>${s}</option>`).join('')}</select></label>
       </div>
       <div class="row" id="new-customer" hidden style="margin-top:.75rem">
@@ -478,17 +526,28 @@ function renderOrderForm(app, id) {
       </div>
       <div class="row" style="margin-top:.75rem">
         <label class="wide">Description<input name="description" required value="${esc(o.description)}"></label>
-        <label class="narrow">Hours<input name="hours" type="number" step="0.25" min="0" value="${esc(o.hours)}"></label>
+        <label class="narrow">Labour hours<input name="hours" type="number" step="0.25" min="0" value="${esc(o.hours)}"></label>
       </div>
+      <label style="margin-top:.75rem">Measurements<textarea name="measurements" placeholder="e.g. 120 × 60 × 4 mm, letters 8 mm tall">${esc(o.measurements || '')}</textarea></label>
       <h2>Filament</h2>
       <div class="lines" id="lines">${(o.filaments && o.filaments.length ? o.filaments : [{ qty: 1 }]).map(lineHtml).join('')}</div>
       <button type="button" id="add-line">+ Add another filament</button>
+      <div class="row" style="margin-top:.75rem">
+        <label class="narrow" style="flex-basis:150px">Failed print allowance (%)<input name="wastePct" type="number" step="1" min="0" value="${esc(o.wastePct ?? 0)}"></label>
+        <label class="narrow" style="flex-basis:150px">Print hours<input name="printHours" type="number" step="0.25" min="0" value="${esc(o.printHours ?? '')}"></label>
+        <label class="narrow" style="flex-basis:170px">Machine rate ($/print hour)<input name="machineRate" type="number" step="0.01" min="0" value="${esc(o.machineRate ?? 0)}"></label>
+      </div>
+      <h2>Links</h2>
+      <p class="small muted">Design files, photos or proofs. One link per line.</p>
+      <textarea name="links" placeholder="https://…">${esc(o.links || '')}</textarea>
+      <div id="link-list" class="small"></div>
       <h2>Comments</h2>
       <textarea name="comments">${esc(o.comments)}</textarea>
 
       <h2>Cost</h2>
       ${hasOverride ? `<div class="note">This order was imported with the amounts you billed at the time, so they're locked. <label style="display:inline;color:inherit"><input type="checkbox" name="unlock"> Recalculate from hours, grams and shipping instead</label></div>` : ''}
       <div class="calc" id="calc"></div>
+      <div id="stock-note" style="margin-top:.5rem"></div>
       ${c && c.shipment ? `<p class="small muted">Shipped in <a href="#/shipment/${esc(c.shipment.id)}">shipment ${esc(c.shipment.number)}</a> on ${esc(c.shipment.date)}${c.shipment.orderIds.length > 1 ? `, shared by ${c.shipment.orderIds.length} orders` : ''}.</p>` : ''}
       ${c && c.payments.length ? `<p class="small muted">Payments: ${c.payments.map((p) => `<a href="#/payment/${esc(p.id)}">#${esc(p.number)}</a>`).join(', ')}</p>` : ''}
 
@@ -509,7 +568,12 @@ function renderOrderForm(app, id) {
 
   const draft = () => {
     const f = new FormData(form);
-    const d = { ...o, number: f.get('number').trim(), customerId: f.get('customerId'), received: f.get('received'), status: f.get('status'), description: f.get('description').trim(), hours: num(f.get('hours')), comments: f.get('comments'), filaments: readLines() };
+    const d = {
+      ...o, number: f.get('number').trim(), customerId: f.get('customerId'), received: f.get('received'), dueDate: f.get('dueDate'),
+      status: f.get('status'), description: f.get('description').trim(), measurements: f.get('measurements'), hours: num(f.get('hours')),
+      printHours: num(f.get('printHours')), machineRate: num(f.get('machineRate')), wastePct: num(f.get('wastePct')),
+      links: f.get('links'), comments: f.get('comments'), filaments: readLines(),
+    };
     if (f.get('unlock')) { delete d.labourOverride; delete d.materialsOverride; delete d.shippingOverride; }
     return d;
   };
@@ -523,11 +587,19 @@ function renderOrderForm(app, id) {
     $('#calc').innerHTML = `
       <span>Labour ${d.labourOverride == null ? `<span class="muted small">${d.hours || 0} h × ${money(rate)}</span>` : ''}${locked('labourOverride')}</span><span class="num">${money(k.labour)}</span>
       ${d.filaments.map((l) => `<span class="muted small">&nbsp;&nbsp;${esc(filamentName(l.filamentId))}: ${l.grams} g × ${l.qty}</span><span class="num muted small">${money(lineCost(db, l))}</span>`).join('')}
-      <span>Materials${locked('materialsOverride')}</span><span class="num">${money(k.materials)}</span>
+      <span>Materials${d.wastePct && d.materialsOverride == null ? ` <span class="muted small">incl. ${d.wastePct}% failed print allowance</span>` : ''}${locked('materialsOverride')}</span><span class="num">${money(k.materials)}</span>
+      ${k.machine ? `<span>Machine <span class="muted small">${d.printHours} h × ${money(d.machineRate)}</span></span><span class="num">${money(k.machine)}</span>` : ''}
       <span>Shipping share${locked('shippingOverride')}</span><span class="num">${money(k.shipping)}</span>
       <span class="total">Total</span><span class="num total">${money(k.total)}</span>
       ${k.paid ? `<span>Paid</span><span class="num">${money(k.paid)}</span><span>Owing</span><span class="num ${k.balance > 0.004 ? 'neg' : ''}">${money(Math.max(0, k.balance))}</span>` : ''}
       ${k.overage ? `<span>Overage received</span><span class="num pos">${money(k.overage)}</span>` : ''}`;
+    $('#link-list').innerHTML = linkList(d.links);
+    const warnings = db.filaments.filter((f) => orderGrams(d).has(f.id)).map((f) => {
+      const left = filamentStock(trial, f);
+      if (left == null) return '';
+      return `<div class="${isLow(f, left) ? 'note' : 'small muted'}">${esc(f.name)}: ${Math.round(left)} g left after this order${left < 0 ? ', which is more than you have in stock' : isLow(f, left) ? ', running low' : ''}.</div>`;
+    }).join('');
+    $('#stock-note').innerHTML = warnings;
   };
 
   form.addEventListener('input', updateCalc);
@@ -766,8 +838,10 @@ function renderStatement(app, params) {
   if (!ids) ids = db.orders.filter((o) => o.customerId === customerId && L.orders.get(o.id).balance > 0.004).map((o) => o.id);
   const chosen = sortOrders(ids.map(orderById).filter(Boolean)).reverse();
   const pool = sortOrders(db.orders.filter((o) => o.customerId === customerId));
-  const totals = { labour: 0, materials: 0, shipping: 0, total: 0, paid: 0 };
+  const totals = { labour: 0, materials: 0, machine: 0, shipping: 0, total: 0, paid: 0 };
   chosen.forEach((o) => { const c = L.orders.get(o.id); for (const k in totals) totals[k] += c[k]; });
+  const mc = totals.machine > 0; // only show a Machine column when something uses it
+  const span = mc ? 6 : 5;
   const pk = payment ? L.payments.get(payment.id) : null;
 
   app.innerHTML = `
@@ -788,26 +862,27 @@ function renderStatement(app, params) {
       <h1>Order statement</h1>
       <p><b>${esc(customerName(customerId))}</b><br><span class="muted">Prepared ${esc(today())}</span></p>
       <div class="table-wrap" style="border:0"><table>
-        <thead><tr><th>Order</th><th>Description</th><th class="num">Labour</th><th class="num">Materials</th><th class="num">Shipping</th><th class="num">Total</th></tr></thead>
+        <thead><tr><th>Order</th><th>Description</th><th class="num">Labour</th><th class="num">Materials</th>${mc ? '<th class="num">Machine</th>' : ''}<th class="num">Shipping</th><th class="num">Total</th></tr></thead>
         <tbody>${chosen.map((o) => {
           const c = L.orders.get(o.id);
           const detail = [
             o.hours ? `${o.hours} h` : '',
-            ...(o.filaments || []).map((l) => `${esc(filamentName(l.filamentId))} ${r2(l.grams * (l.qty || 1))} g`),
+            o.printHours && c.machine ? `${o.printHours} h printing` : '',
+            ...(o.filaments || []).map((l) => `${esc(filamentName(l.filamentId))} ${r2(lineGrams(l))} g`),
             c.shipment && c.shipment.orderIds.length > 1 ? `shipping shared with ${c.shipment.orderIds.length - 1} other order${c.shipment.orderIds.length > 2 ? 's' : ''}` : '',
           ].filter(Boolean).join(' · ');
-          return `<tr><td>#${esc(o.number)}<br><span class="muted small">${esc(o.received || '')}</span></td><td>${esc(o.description)}<br><span class="muted small">${detail}</span></td>
-            <td class="num">${money(c.labour)}</td><td class="num">${money(c.materials)}</td><td class="num">${money(c.shipping)}</td><td class="num">${money(c.total)}</td></tr>`;
-        }).join('') || '<tr><td colspan="6" class="muted">No orders selected.</td></tr>'}</tbody>
+          return `<tr><td>#${esc(o.number)}<br><span class="muted small">${esc(o.received || '')}</span></td><td>${esc(o.description)}${o.measurements ? `<br><span class="small">${esc(o.measurements)}</span>` : ''}<br><span class="muted small">${detail}</span></td>
+            <td class="num">${money(c.labour)}</td><td class="num">${money(c.materials)}</td>${mc ? `<td class="num">${money(c.machine)}</td>` : ''}<td class="num">${money(c.shipping)}</td><td class="num">${money(c.total)}</td></tr>`;
+        }).join('') || `<tr><td colspan="${span + 1}" class="muted">No orders selected.</td></tr>`}</tbody>
         <tfoot>
-          <tr><td colspan="2">Total</td><td class="num">${money(totals.labour)}</td><td class="num">${money(totals.materials)}</td><td class="num">${money(totals.shipping)}</td><td class="num">${money(totals.total)}</td></tr>
-          ${payment ? `<tr><td colspan="5">Payment received ${esc(payment.date)}</td><td class="num">${money(payment.amount)}</td></tr>
-            <tr><td colspan="5">${pk.overage >= 0 ? 'Paid over the bill' : 'Still owing'}</td><td class="num">${money(Math.abs(pk.overage))}</td></tr>`
-          : `<tr><td colspan="5">Paid</td><td class="num">${money(totals.paid)}</td></tr>
-            <tr><td colspan="5">Balance due</td><td class="num">${money(Math.max(0, totals.total - totals.paid))}</td></tr>`}
+          <tr><td colspan="2">Total</td><td class="num">${money(totals.labour)}</td><td class="num">${money(totals.materials)}</td>${mc ? `<td class="num">${money(totals.machine)}</td>` : ''}<td class="num">${money(totals.shipping)}</td><td class="num">${money(totals.total)}</td></tr>
+          ${payment ? `<tr><td colspan="${span}">Payment received ${esc(payment.date)}</td><td class="num">${money(payment.amount)}</td></tr>
+            <tr><td colspan="${span}">${pk.overage >= 0 ? 'Paid over the bill' : 'Still owing'}</td><td class="num">${money(Math.abs(pk.overage))}</td></tr>`
+          : `<tr><td colspan="${span}">Paid</td><td class="num">${money(totals.paid)}</td></tr>
+            <tr><td colspan="${span}">Balance due</td><td class="num">${money(Math.max(0, totals.total - totals.paid))}</td></tr>`}
         </tfoot>
       </table></div>
-      <p class="muted small">Labour at ${money(rateOn(db, today()))}/hour. Materials charged by filament weight. Shared shipments are split evenly across the orders in the box.</p>
+      <p class="muted small">Labour at ${money(rateOn(db, today()))}/hour. Materials charged by filament weight${totals.machine ? ', machine time by print hour' : ''}. Shared shipments are split evenly across the orders in the box.</p>
     </div>`;
 
   $('#print').onclick = () => window.print();
@@ -873,14 +948,42 @@ function renderCustomers(app) {
 
 function renderFilaments(app) {
   const used = new Set(db.orders.flatMap((o) => (o.filaments || []).map((l) => l.filamentId)));
+  const history = db.filaments.flatMap((f) => (f.stockLog || []).map((e) => ({ ...e, f }))).sort((a, b) => b.at.localeCompare(a.at));
   app.innerHTML = `
     <h1>Filaments</h1>
     <p class="muted small">Materials cost = grams used × (spool price ÷ spool weight). Changing a price affects every order that isn't locked to its billed amount.</p>
     <div class="table-wrap"><table>
-      <thead><tr><th>Filament</th><th class="num">Spool price</th><th class="num">Spool weight</th><th class="num">Per gram</th><th></th></tr></thead>
-      <tbody>${db.filaments.map((f) => `<tr><td>${esc(f.name)}</td><td class="num">${money(f.spoolCost)}</td><td class="num">${esc(f.spoolGrams)} g</td><td class="num">$${perGram(f).toFixed(4)}</td>
-        <td><button class="link" data-edit="${esc(f.id)}">Edit</button>${used.has(f.id) ? '' : ` <button class="link danger" data-del="${esc(f.id)}">Delete</button>`}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">No filaments yet.</td></tr>'}</tbody>
+      <thead><tr><th>Filament</th><th class="num">Spool price</th><th class="num hide-sm">Spool weight</th><th class="num hide-sm">Per gram</th><th class="num">In stock</th><th></th></tr></thead>
+      <tbody>${db.filaments.map((f) => {
+        const left = filamentStock(db, f);
+        const stock = left == null ? '<span class="muted small">Not tracked</span>' : `<span class="${isLow(f, left) ? 'neg' : ''}">${Math.round(left)} g${isLow(f, left) ? ' <b>low</b>' : ''}</span>`;
+        return `<tr><td>${esc(f.name)}</td><td class="num">${money(f.spoolCost)}</td><td class="num hide-sm">${esc(f.spoolGrams)} g</td><td class="num hide-sm">$${perGram(f).toFixed(4)}</td><td class="num">${stock}</td>
+        <td><button class="link" data-edit="${esc(f.id)}">Edit</button>${used.has(f.id) ? '' : ` <button class="link danger" data-del="${esc(f.id)}">Delete</button>`}</td></tr>`;
+      }).join('') || '<tr><td colspan="6" class="muted">No filaments yet.</td></tr>'}</tbody>
     </table></div>
+
+    <form id="stock" class="panel" style="margin-top:1rem">
+      <h2 style="margin-top:0">Update stock</h2>
+      <p class="small muted">Start by counting what you have on hand for each filament. After that, orders you create use up their grams (including the failed print allowance), and you add spools as you buy them.</p>
+      <div class="row">
+        <label>Filament<select name="filamentId" required>${db.filaments.map((f) => `<option value="${esc(f.id)}">${esc(f.name)}</option>`).join('')}</select></label>
+        <label>What happened<select name="type"><option value="add">Bought a spool</option><option value="count">Counted what's on hand</option></select></label>
+        <label class="narrow" style="flex-basis:150px">Date<input name="date" type="date" required value="${esc(today())}"></label>
+      </div>
+      <div class="row" style="margin-top:.75rem">
+        <label class="narrow" style="flex-basis:150px">Grams<input name="grams" type="number" step="1" min="0" required></label>
+        <label class="narrow" style="flex-basis:150px" id="stock-cost">Price paid<input name="cost" type="number" step="0.01" min="0"></label>
+        <label>Note<input name="note" placeholder="Optional"></label>
+      </div>
+      <div class="toolbar" style="margin-top:.75rem"><button class="primary" type="submit">Save</button></div>
+    </form>
+
+    ${history.length ? `<h2>Stock history</h2><div class="table-wrap"><table>
+      <thead><tr><th>Date</th><th>Filament</th><th>Entry</th><th class="num">Grams</th><th class="num">Paid</th><th class="hide-sm">Note</th><th></th></tr></thead>
+      <tbody>${history.slice(0, 50).map((e) => `<tr><td>${esc(e.date)}</td><td>${esc(e.f.name)}</td><td>${e.type === 'add' ? 'Bought spool' : 'Counted'}</td><td class="num">${esc(e.grams)}</td><td class="num">${e.cost ? money(e.cost) : ''}</td><td class="hide-sm">${esc(e.note || '')}</td>
+        <td><button class="link danger" data-del-stock="${esc(e.f.id)}|${esc(e.at)}">Remove</button></td></tr>`).join('')}</tbody>
+    </table></div>` : ''}
+
     <form id="fil" class="panel" style="margin-top:1rem">
       <h2 id="fil-title" style="margin-top:0">Add filament</h2>
       <input type="hidden" name="id">
@@ -888,14 +991,55 @@ function renderFilaments(app) {
         <label>Name<input name="name" required placeholder="e.g. Red PLA"></label>
         <label class="narrow">Spool price<input name="spoolCost" type="number" step="0.01" min="0" required></label>
         <label class="narrow">Spool weight (g)<input name="spoolGrams" type="number" step="1" min="1" value="1000" required></label>
+        <label class="narrow">Warn below (g)<input name="lowGrams" type="number" step="1" min="0" value="200" required></label>
       </div>
       <div class="toolbar" style="margin-top:.75rem"><button class="primary" type="submit">Save filament</button><button type="reset">Clear</button></div>
     </form>`;
+
+  const stockForm = $('#stock');
+  const syncStockDefaults = () => {
+    const f = db.filaments.find((x) => x.id === stockForm.elements.filamentId.value);
+    const isAdd = stockForm.elements.type.value === 'add';
+    $('#stock-cost').hidden = !isAdd;
+    if (f) {
+      stockForm.elements.grams.value = isAdd ? f.spoolGrams : (filamentStock(db, f) != null ? Math.max(0, Math.round(filamentStock(db, f))) : '');
+      stockForm.elements.cost.value = isAdd ? f.spoolCost : '';
+    }
+  };
+  stockForm.elements.filamentId.onchange = syncStockDefaults;
+  stockForm.elements.type.onchange = syncStockDefaults;
+  syncStockDefaults();
+  stockForm.onsubmit = async (e) => {
+    e.preventDefault();
+    const fd = new FormData(stockForm);
+    const date = fd.get('date');
+    // Entries dated today use the current time, so orders created later today count against them.
+    const at = date === today() ? new Date().toISOString() : `${date}T23:59:59.000Z`;
+    const entry = { at, date, type: fd.get('type'), grams: num(fd.get('grams')), note: fd.get('note').trim() };
+    if (entry.type === 'add') entry.cost = r2(num(fd.get('cost')));
+    const f = db.filaments.find((x) => x.id === fd.get('filamentId'));
+    if (await commit(`${entry.type === 'add' ? 'Add spool of' : 'Count stock of'} ${f.name}`, (data) => {
+      const t = data.filaments.find((x) => x.id === f.id);
+      t.stockLog = [...(t.stockLog || []), entry];
+    })) renderFilaments(app);
+  };
+  $$('[data-del-stock]', app).forEach((b) => {
+    b.onclick = async () => {
+      const [fid, at] = b.dataset.delStock.split('|');
+      if (!confirm('Remove this stock entry?')) return;
+      if (await commit('Remove stock entry', (data) => {
+        const t = data.filaments.find((x) => x.id === fid);
+        t.stockLog = (t.stockLog || []).filter((x) => x.at !== at);
+      })) renderFilaments(app);
+    };
+  });
+
   const form = $('#fil');
   $$('[data-edit]', app).forEach((b) => {
     b.onclick = () => {
       const f = db.filaments.find((x) => x.id === b.dataset.edit);
       for (const k of ['id', 'name', 'spoolCost', 'spoolGrams']) form.elements[k].value = f[k];
+      form.elements.lowGrams.value = f.lowGrams ?? 200;
       $('#fil-title').textContent = `Edit ${f.name}`;
       form.scrollIntoView({ behavior: 'smooth' });
     };
@@ -910,10 +1054,10 @@ function renderFilaments(app) {
   form.onsubmit = async (e) => {
     e.preventDefault();
     const fd = new FormData(form);
-    const f = { id: fd.get('id') || uid('f'), name: fd.get('name').trim(), spoolCost: r2(num(fd.get('spoolCost'))), spoolGrams: num(fd.get('spoolGrams')) };
+    const f = { id: fd.get('id') || uid('f'), name: fd.get('name').trim(), spoolCost: r2(num(fd.get('spoolCost'))), spoolGrams: num(fd.get('spoolGrams')), lowGrams: num(fd.get('lowGrams')) };
     const ok = await commit(`Save filament ${f.name}`, (data) => {
       const i = data.filaments.findIndex((x) => x.id === f.id);
-      if (i >= 0) data.filaments[i] = f; else data.filaments.push(f);
+      if (i >= 0) data.filaments[i] = { ...data.filaments[i], ...f }; else data.filaments.push(f);
     });
     if (ok) renderFilaments(app);
   };
@@ -939,6 +1083,16 @@ function renderSettings(app) {
       </form>
     </div>
     <div class="panel">
+      <h2 style="margin-top:0">Defaults for new orders</h2>
+      <p class="small muted">Each new order starts with these values, and you can change them on the order. Changing them here doesn't affect orders you've already entered.</p>
+      <form id="defaults" class="row">
+        <label class="narrow" style="flex-basis:190px">Machine rate ($ per print hour)<input name="machineRate" type="number" step="0.01" min="0" value="${esc(db.settings.machineRate ?? 0)}"></label>
+        <label class="narrow" style="flex-basis:190px">Failed print allowance (%)<input name="wastePct" type="number" step="1" min="0" value="${esc(db.settings.wastePct ?? 0)}"></label>
+        <div style="flex:0 0 auto"><button type="submit">Save defaults</button></div>
+      </form>
+      <p class="small muted">Machine rate covers electricity and wear. For example, a printer drawing 150 W at $0.15/kWh costs about $0.02 an hour in power; many people charge $0.50 to $1.00 an hour to cover nozzles, belts and the printer itself.</p>
+    </div>
+    <div class="panel">
       <h2 style="margin-top:0">Your data</h2>
       <p>Stored in <b>${esc(store.label)}</b>.${store instanceof GitHubStore ? ' Every change is saved as a commit there, so you can see the full history on GitHub.' : ' Nothing is synced to other devices in this mode.'}</p>
       <div class="toolbar">
@@ -956,6 +1110,14 @@ function renderSettings(app) {
     const r = { from: f.get('from'), rate: num(f.get('rate')) };
     if (await commit(`Set labour rate ${r.rate} from ${r.from}`, (data) => {
       data.settings.labourRates = data.settings.labourRates.filter((x) => x.from !== r.from).concat(r);
+    })) renderSettings(app);
+  };
+  $('#defaults').onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    if (await commit('Update order defaults', (data) => {
+      data.settings.machineRate = num(f.get('machineRate'));
+      data.settings.wastePct = num(f.get('wastePct'));
     })) renderSettings(app);
   };
   $$('[data-del-rate]', app).forEach((b) => {
@@ -997,31 +1159,158 @@ function loadScript(src) {
   });
 }
 
+async function ensureXlsx() {
+  if (window.XLSX) return true;
+  try { await loadScript(SHEETJS_URL); return true; } catch (e) { alert(e.message); return false; }
+}
+
+function orderExportRow(o, L) {
+  const c = L.orders.get(o.id);
+  return {
+    'Order #': o.number, Customer: customerName(o.customerId), Received: o.received, Due: o.dueDate || '', Description: o.description,
+    Measurements: o.measurements || '', 'Labour hours': o.hours, 'Print hours': o.printHours || '',
+    Filament: (o.filaments || []).map((l) => `${filamentName(l.filamentId)} ${l.grams}g${l.qty > 1 ? ' x' + l.qty : ''}`).join('; '),
+    'Grams used': r2(sum([...orderGrams(o).values()])), 'Failed print %': o.wastePct || 0,
+    Labour: c.labour, Materials: c.materials, Machine: c.machine, Shipping: c.shipping, Total: c.total, Paid: c.paid, Overage: c.overage, Owing: Math.max(0, c.balance),
+    'Shipment #': c.shipment?.number ?? '', 'Date shipped': c.shipment?.date ?? '', 'Payment #': c.payments.map((p) => p.number).join(', '),
+    Status: o.status, Links: o.links || '', Comments: o.comments,
+  };
+}
+
 async function exportExcel() {
-  try {
-    if (!window.XLSX) await loadScript(SHEETJS_URL);
-  } catch (e) { alert(e.message); return; }
+  if (!(await ensureXlsx())) return;
   const L = ledger(db);
-  const orders = sortOrders(db.orders).reverse().map((o) => {
-    const c = L.orders.get(o.id);
-    return {
-      'Order #': o.number, Customer: customerName(o.customerId), Received: o.received, Description: o.description,
-      Hours: o.hours, Filament: (o.filaments || []).map((l) => `${filamentName(l.filamentId)} ${l.grams}g${l.qty > 1 ? ' x' + l.qty : ''}`).join('; '),
-      'Grams total': r2(sum((o.filaments || []).map((l) => l.grams * (l.qty || 1)))),
-      Labour: c.labour, Materials: c.materials, Shipping: c.shipping, Total: c.total, Paid: c.paid, Overage: c.overage, Owing: Math.max(0, c.balance),
-      'Shipment #': c.shipment?.number ?? '', 'Date shipped': c.shipment?.date ?? '', 'Payment #': c.payments.map((p) => p.number).join(', '),
-      Status: o.status, Comments: o.comments,
-    };
-  });
+  const orders = sortOrders(db.orders).reverse().map((o) => orderExportRow(o, L));
   const shipments = db.shipments.map((s) => ({ 'Shipment #': s.number, Date: s.date, Cost: s.cost, Orders: s.orderIds.map((id) => orderById(id)?.number).join(', '), Tracking: s.tracking, Notes: s.notes }));
   const payments = db.payments.map((p) => { const k = L.payments.get(p.id); return { 'Payment #': p.number, Date: p.date, From: customerName(p.customerId), Amount: p.amount, Billed: k.owed, Overage: k.overage, Orders: p.orderIds.map((id) => orderById(id)?.number).join(', '), Notes: p.notes }; });
-  const filaments = db.filaments.map((f) => ({ Filament: f.name, 'Spool price': f.spoolCost, 'Spool weight (g)': f.spoolGrams, 'Per gram': perGram(f) }));
+  const filaments = db.filaments.map((f) => ({ Filament: f.name, 'Spool price': f.spoolCost, 'Spool weight (g)': f.spoolGrams, 'Per gram': perGram(f), 'In stock (g)': filamentStock(db, f) ?? '' }));
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(orders), 'Orders');
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(shipments), 'Shipping');
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(payments), 'Payments');
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(filaments), 'Materials');
   XLSX.writeFile(wb, `print-tracker-${today()}.xlsx`);
+}
+
+/* ---------- Yearly summary ---------- */
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+function yearSummary(year) {
+  const L = ledger(db);
+  const inYear = (d) => (d || '').startsWith(year);
+  const monthOf = (d) => Number(d.slice(5, 7)) - 1;
+  const orders = db.orders.filter((o) => inYear(o.received));
+  const payments = db.payments.filter((p) => inYear(p.date));
+  const shipments = db.shipments.filter((s) => inYear(s.date));
+  const spools = db.filaments.flatMap((f) => (f.stockLog || []).filter((e) => e.type === 'add' && inYear(e.date)).map((e) => ({ ...e, f })));
+  const billed = { labour: 0, materials: 0, machine: 0, shipping: 0, total: 0 };
+  orders.forEach((o) => { const c = L.orders.get(o.id); for (const k in billed) billed[k] += c[k]; });
+  const income = sum(payments.map((p) => p.amount));
+  const overage = sum(payments.map((p) => L.payments.get(p.id).overage));
+  const shippingPaid = sum(shipments.map((s) => s.cost));
+  const filamentBought = sum(spools.map((e) => e.cost));
+  const months = MONTHS.map((name, i) => {
+    const mo = orders.filter((o) => monthOf(o.received) === i);
+    return {
+      Month: name,
+      'Orders received': mo.length,
+      'Labour hours': r2(sum(mo.map((o) => o.hours))),
+      Billed: r2(sum(mo.map((o) => L.orders.get(o.id).total))),
+      'Payments received': r2(sum(payments.filter((p) => monthOf(p.date) === i).map((p) => p.amount))),
+      'Shipping paid': r2(sum(shipments.filter((s) => monthOf(s.date) === i).map((s) => s.cost))),
+      'Filament bought': r2(sum(spools.filter((e) => monthOf(e.date) === i).map((e) => e.cost))),
+    };
+  });
+  const grams = new Map();
+  orders.forEach((o) => orderGrams(o).forEach((g, fid) => grams.set(fid, (grams.get(fid) || 0) + g)));
+  return {
+    L, orders, billed, income, overage, shippingPaid, filamentBought, months, grams,
+    hours: r2(sum(orders.map((o) => o.hours))),
+    net: r2(income - shippingPaid - filamentBought),
+  };
+}
+
+function renderSummary(app, params) {
+  const years = [...new Set([
+    ...db.orders.map((o) => (o.received || '').slice(0, 4)),
+    ...db.payments.map((p) => (p.date || '').slice(0, 4)),
+    today().slice(0, 4),
+  ].filter(Boolean))].sort().reverse();
+  const year = params.get('year') || today().slice(0, 4);
+  const y = yearSummary(year);
+  const line = (label, value, cls = '') => `<span>${label}</span><span class="num ${cls}">${value}</span>`;
+
+  app.innerHTML = `
+    <div class="toolbar">
+      <h1 style="margin:0">Yearly summary</h1><span class="spacer"></span>
+      <select id="year" style="width:auto">${years.map((x) => `<option ${x === year ? 'selected' : ''}>${x}</option>`).join('')}</select>
+      <button id="export-year">Export ${esc(year)} to Excel</button>
+    </div>
+    <div class="cards">
+      <div class="card"><div class="label">Payments received</div><div class="value">${money(y.income)}</div></div>
+      <div class="card"><div class="label">Shipping paid</div><div class="value">${money(y.shippingPaid)}</div></div>
+      <div class="card"><div class="label">Filament bought</div><div class="value">${money(y.filamentBought)}</div></div>
+      <div class="card"><div class="label">Net after shipping and filament</div><div class="value">${money(y.net)}</div></div>
+    </div>
+    <div class="row" style="align-items:stretch">
+      <div class="panel">
+        <h2 style="margin-top:0">Cash in and out</h2>
+        <div class="calc">
+          ${line('Payments received', money(y.income))}
+          ${line('<span class="muted small">of which overage</span>', money(y.overage), 'muted small')}
+          ${line('Shipping paid', money(-y.shippingPaid))}
+          ${line('Filament bought', money(-y.filamentBought))}
+          <span class="total">Net</span><span class="num total">${money(y.net)}</span>
+        </div>
+        <p class="small muted">Uses payment dates, shipment dates and the spools logged on the Filaments page.</p>
+      </div>
+      <div class="panel">
+        <h2 style="margin-top:0">Orders received in ${esc(year)}</h2>
+        <div class="calc">
+          ${line('Orders', y.orders.length)}
+          ${line('Labour hours', y.hours)}
+          ${line('Labour billed', money(y.billed.labour))}
+          ${line('Materials billed', money(y.billed.materials))}
+          ${y.billed.machine ? line('Machine time billed', money(y.billed.machine)) : ''}
+          ${line('Shipping billed', money(y.billed.shipping))}
+          <span class="total">Total billed</span><span class="num total">${money(y.billed.total)}</span>
+        </div>
+      </div>
+      <div class="panel">
+        <h2 style="margin-top:0">Filament used</h2>
+        <div class="calc">${[...y.grams].map(([fid, g]) => line(esc(filamentName(fid)), `${Math.round(g)} g`)).join('') || '<span class="muted">None</span>'}</div>
+      </div>
+    </div>
+    <h2>By month</h2>
+    <div class="table-wrap"><table>
+      <thead><tr>${Object.keys(y.months[0]).map((k) => `<th class="${k === 'Month' ? '' : 'num'}">${k}</th>`).join('')}</tr></thead>
+      <tbody>${y.months.map((m) => `<tr>${Object.entries(m).map(([k, v]) => `<td class="${k === 'Month' ? '' : 'num'}">${typeof v === 'number' && !['Orders received', 'Labour hours'].includes(k) ? (v ? money(v) : '—') : (v || (k === 'Month' ? v : '—'))}</td>`).join('')}</tr>`).join('')}</tbody>
+    </table></div>`;
+
+  $('#year').onchange = (e) => { location.hash = `#/summary?year=${e.target.value}`; };
+  $('#export-year').onclick = async () => {
+    if (!(await ensureXlsx())) return;
+    const summary = [
+      { Item: 'Payments received', Amount: r2(y.income) },
+      { Item: 'Of which overage', Amount: r2(y.overage) },
+      { Item: 'Shipping paid', Amount: r2(y.shippingPaid) },
+      { Item: 'Filament bought', Amount: r2(y.filamentBought) },
+      { Item: 'Net after shipping and filament', Amount: y.net },
+      { Item: 'Orders received', Amount: y.orders.length },
+      { Item: 'Labour hours', Amount: y.hours },
+      { Item: 'Labour billed', Amount: r2(y.billed.labour) },
+      { Item: 'Materials billed', Amount: r2(y.billed.materials) },
+      { Item: 'Machine time billed', Amount: r2(y.billed.machine) },
+      { Item: 'Shipping billed', Amount: r2(y.billed.shipping) },
+      { Item: 'Total billed', Amount: r2(y.billed.total) },
+    ];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(summary), 'Summary');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(y.months), 'By month');
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(sortOrders(y.orders).reverse().map((o) => orderExportRow(o, y.L))), 'Orders');
+    XLSX.writeFile(wb, `print-tracker-${year}-summary.xlsx`);
+  };
 }
 
 /* ---------- Start ---------- */
